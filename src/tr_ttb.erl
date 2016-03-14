@@ -197,7 +197,7 @@ node_prefix(P) ->
 
 cb(Mod, F, Args, Default) ->
     ensure_loaded(Mod),
-    case erlang:is_function_exported(Mod, F, length(Args)) of
+    case erlang:function_exported(Mod, F, length(Args)) of
         true ->
             apply(Mod, F, Args);
         false ->
