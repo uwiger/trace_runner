@@ -9,7 +9,7 @@
 %%
 %%---- END COPYRIGHT ---------------------------------------------------------
 
--ifdef(event).
+-ifndef(event).
 
 -define(costly_event(E),
         case erlang:trace_info({MODULE,event,3}, traced) of
