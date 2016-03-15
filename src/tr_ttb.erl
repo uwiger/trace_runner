@@ -54,7 +54,7 @@ on_nodes(Ns, File, Mod) ->
                 [{mod, Mod}, {file, File}]).
 
 on_nodes(Ns, Patterns, Flags, Opts) ->
-    ttb:start_trace(Ns, Patterns, Flags, Opts).
+    ttb:start_trace(Ns, Patterns, Flags, lists:keydelete(mod, 1, Opts)).
 
 default_patterns() ->
     [{?MODULE     , event, 3, []}].
