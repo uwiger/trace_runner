@@ -22,6 +22,7 @@
          stop_nofetch/0,
          format/1,
          format/2,
+         format/3,
          format_opts/0,
          format_opts/1,
          handler/4,
@@ -73,47 +74,185 @@ format(Dir) ->
     format(Dir, standard_io).
 
 format(Dir, OutFile) ->
-    ttb:format(Dir, format_opts(OutFile)).
+    format(Dir, OutFile, default_opts()).
+
+format(Dir, OutFile, Opts) ->
+    try ttb:format(Dir, format_opts(OutFile, Opts))
+    catch
+        error:exceeded_limit = Reason ->
+            {error, Reason};
+        error:Other ->
+            {error, {Other, erlang:get_stacktrace()}}
+    end.
 
 format_opts() ->
     format_opts(standard_io).
 
-format_opts(OutFile) ->
-    [{out, OutFile}, {handler, {fun handler/4, {0,0}}}].
+format_opts(Outfile) ->
+    format_opts(Outfile, default_opts()).
 
-handler(Fd, Trace, _, {Tp,Diff} = Acc) ->
-    if Acc == {0,0} ->
-            io:fwrite(Fd, "%% -*- erlang -*-~n", []);
-       true -> ok
-    end,
-    case Trace of
-        {trace_ts,{_, _, Node},
-         call,
-         {Mod, event, [Line, Evt, State]}, TS} when is_integer(Line) ->
-            Tdiff = tdiff(TS, Tp),
-            Diff1 = Diff + Tdiff,
-            print(Fd, Node, Mod, Line, Evt, State, Diff1),
-            case get_pids({Evt, State}) of
-                [] -> ok;
-                Pids ->
-                    io:fwrite(Fd, "    Nodes = ~p~n", [Pids])
-            end,
-            {TS, Diff1};
-        _ ->
-            io:fwrite(Fd, "~p~n", [Trace]),
-            {Tp, Diff}
+format_opts(OutFile, Opts) ->
+    Limit = maps:get(limit, Opts, infinity),
+    [{out, OutFile}, {handler, {fun handler/4, #{ts => 0,
+                                                 diff => 0,
+                                                 sofar => 0,
+                                                 limit => Limit,
+                                                 opts => Opts}}}].
+
+default_opts() ->
+    #{limit => 10000}.
+
+
+
+handler(Fd, Trace, _, #{ts := TSp, diff := Diff, sofar := Sofar} = Acc) ->
+    TS = ts(Trace, TSp),
+    L0 = case {TSp,Diff} of {0,0} ->
+                 io:fwrite(Fd, "%% -*- erlang -*-~n", []),
+                 io:put_chars(Fd, format_time(TS)),
+                 2;
+             _ -> 0
+         end,
+    Tdiff = tdiff(TS, TSp),
+    Diff1 = Diff + Tdiff,
+    Sofar1 = Sofar + L0,
+    Acc1 = Acc#{sofar => Sofar1, ts => TS, diff => Diff1},
+    check_limit_exceeded(Acc1),
+    Lines =
+        case Trace of
+            {trace_ts,{Pid, _, Node}, call, {Mod, Fun, Args}, TS} ->
+                print_call(Fd, Pid, Node, Mod, Fun, Args, Diff1);
+            {trace_ts,{Pid, _, Node}, Type, {Mod, Fun, Arity}, Info, TS}
+              when Type =:= return_from; Type =:= exception_from ->
+                print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, Diff1);
+            TraceTS when element(1, TraceTS) == trace_ts ->
+                fwrite(Fd, "~p~n", [Trace]);
+            _ ->
+                fwrite(Fd, "~p~n", [Trace])
+        end,
+    Acc1#{sofar => Sofar1 + Lines}.
+
+fwrite(Fd, Fmt, Args) ->
+    io_reqs(Fd, [{put_chars, io_lib:fwrite(Fmt, Args)}]).
+
+io_reqs(Fd, Rs) ->
+    Lines = count_lines(Rs),
+    io:requests(Fd, Rs),
+    Lines.
+
+count_lines(Rs) ->
+    lists:foldl(
+      fun(nl, Acc) -> Acc+1;
+         ({put_chars, Cs}, Acc) ->
+              count_newlines(Cs) + Acc;
+         ({put_chars, unicode, Cs}, Acc) ->
+              count_newlines(Cs) + Acc
+      end, 0, Rs).
+
+count_newlines(Cs) ->
+    case re:run(Cs, <<"\\v">>, [global]) of
+        {match, Ms} ->
+            length(Ms);
+        nomatch ->
+            0
     end.
+
+
+check_limit_exceeded(#{sofar := Sofar, limit := Limit}) ->
+    if Sofar > Limit ->
+            error(limit_exceeded);
+       true ->
+            ok
+    end.
+
+ts(Trace, _TSp) when element(1, Trace) == trace_ts ->
+    Sz = tuple_size(Trace),
+    element(Sz, Trace);
+ts(_, TSp) ->
+    TSp.
+
+
+
+print_call(Fd, Pid, Node, Mod, Fun, Args, Diff) ->
+    case {Fun, Args} of
+        {event, [Line, Evt, State]} when is_integer(Line) ->
+            Lines = print_evt(Fd, Pid, Node, Mod, Line, Evt, State, Diff),
+            case get_pids({Evt, State}) of
+                [] -> Lines;
+                Pids ->
+                    Lines1 = fwrite(Fd, "    Nodes = ~p~n", [Pids]),
+                    Lines + Lines1
+            end;
+        _ ->
+            print_call_(Fd, Pid, Node, Mod, Fun, Args, Diff)
+    end.
+
+print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, T) ->
+    Tstr = io_lib:fwrite("~w", [T]),
+    Indent = iolist_size(Tstr) + 3 + 4,
+    Head = io_lib:fwrite(" - ~w~w|~w:~w/~w " ++ typestr(Type),
+                         [Pid, Node, Mod, Fun, Arity]),
+    Line1Len = iolist_size([Tstr, Head]),
+    InfoPP = pp(Info, 1, Mod),
+    Res = case fits_on_line(InfoPP, Line1Len, 79) of  %% minus space
+              true  -> [" ", InfoPP];
+              false ->
+                  ["\n", indent(Indent), pp(Info, Indent, Mod)]
+          end,
+    io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, Res]}, nl]).
+
+typestr(return_from   ) -> "->";
+typestr(exception_from) -> "xx~~>".
+
 
 -define(CHAR_MAX, 60).
 
-print(Fd, N, Mod, L, E, St, T) ->
+print_evt(Fd, Pid, N, Mod, L, E, St, T) ->
     Tstr = io_lib:fwrite("~w", [T]),
     Indent = iolist_size(Tstr) + 3,
-    Head = io_lib:fwrite(" - ~w|~w/~w: ", [N, Mod, L]),
+    Head = io_lib:fwrite(" - ~w~w|~w/~w: ", [Pid, N, Mod, L]),
     EvtCol = iolist_size(Head) + 1,
     EvtCs = pp(E, EvtCol, Mod),
-    io:requests(Fd, [{put_chars, unicode, [Tstr, Head, EvtCs]}, nl
-                     | print_tail(St, Mod, Indent)]).
+    io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, EvtCs]}, nl
+                 | print_tail(St, Mod, Indent)]).
+
+print_call_(Fd, Pid, N, Mod, Fun, Args, T) ->
+    Tstr = io_lib:fwrite("~w", [T]),
+    Indent = iolist_size(Tstr) + 3 + 4,
+        %% + (iolist_size(io_lib:fwrite("~w", [N])) div 2),
+    Head = io_lib:fwrite(" - ~w~w|~w:~w(", [Pid, N, Mod, Fun]),
+    Line1Len = iolist_size([Tstr, Head]),
+    PlainArgs = rm_brackets(pp(Args, 1, Mod)),
+    Rest = case fits_on_line(PlainArgs, Line1Len, 79) of %% minus )
+               true -> [PlainArgs, ")"];
+               false ->
+                   ["\n", indent(Indent),
+                    rm_brackets(pp(Args, Indent, Mod)), ")"]
+           end,
+    io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, Rest]}, nl]).
+
+indent(N) ->
+    lists:duplicate(N, $\s).
+
+rm_brackets(Str) ->
+    %% allow for whitespace (incl vertical) before and after
+    B = iolist_to_binary(Str),
+    Sz = byte_size(B),
+    {Open,1} = binary:match(B, [<<"[">>]),
+    {Close,1} = lists:last(
+                  binary:matches(B, [<<"]">>])),
+    SzA = Open + 1,
+    SzB = Sz-Close,
+    SzMid = Sz - SzA - SzB,
+    <<_:SzA/unit:8,Mid:SzMid/binary,_/binary>> = B,
+    Mid.
+
+fits_on_line(IOList, Len, LineLen) ->
+    iolist_size(IOList) + Len =< LineLen
+        andalso has_no_line_breaks(IOList).
+
+has_no_line_breaks(IOL) ->
+    nomatch =:= re:run(IOL, <<"\\v">>).
+
 
 print_tail(none, _, _Col) -> [];
 print_tail(St, Mod, Col) ->
@@ -148,16 +287,41 @@ tdiff(TS, T0) ->
 
 record_print_fun(Mod) ->
     fun(Tag, NoFields) ->
-            try Mod:record_fields(Tag) of
+            record_print_fun_(Mod, Tag, NoFields, [])
+    end.
+
+record_print_fun_(Mod, Tag, NoFields, V) ->
+    try Mod:record_fields(Tag) of
+        Fields when is_list(Fields) ->
+            case length(Fields) of
+                NoFields -> Fields;
+                _ -> no
+            end;
+        {check_mods, Mods} when is_list(Mods) ->
+            check_mods(Mods, Tag, NoFields, V);
+        no -> no
+    catch
+        _:_ ->
+            no
+    end.
+
+check_mods([], _, _, _) ->
+    no;
+check_mods([M|Mods], Tag, NoFields, V) ->
+    Cont = fun(V1) -> check_mods(Mods, Tag, NoFields, V1) end,
+    case lists:member(M, V) of
+        true ->
+            Cont(V);
+        false ->
+            V1 = [M|V],
+            try record_print_fun_(M, Tag, NoFields, V1) of
                 Fields when is_list(Fields) ->
-                    case length(Fields) of
-                        NoFields -> Fields;
-                        _ -> no
-                    end;
-                no -> no
+                    Fields;
+                no ->
+                    Cont(V1)
             catch
                 _:_ ->
-                    no
+                    Cont(V1)
             end
     end.
 
@@ -211,3 +375,63 @@ ensure_loaded(Mod) ->
         {error, _} ->
             false
     end.
+
+
+%% ==================================================================
+%% Copied from lager_default_formatter.erl, lager_util.erl
+
+format_time(Now) ->
+    {Date, Time} = format_time_(maybe_utc(localtime_ms(Now))),
+    ["=== Start time: ", Date, " ", Time, " ===\n"].
+
+format_time_({utc, {{Y, M, D}, {H, Mi, S, Ms}}}) ->
+    {[integer_to_list(Y), $-, i2l(M), $-, i2l(D)],
+     [i2l(H), $:, i2l(Mi), $:, i2l(S), $., i3l(Ms), $ , $U, $T, $C]};
+format_time_({{Y, M, D}, {H, Mi, S, Ms}}) ->
+    {[integer_to_list(Y), $-, i2l(M), $-, i2l(D)],
+     [i2l(H), $:, i2l(Mi), $:, i2l(S), $., i3l(Ms)]};
+format_time_({utc, {{Y, M, D}, {H, Mi, S}}}) ->
+    {[integer_to_list(Y), $-, i2l(M), $-, i2l(D)],
+     [i2l(H), $:, i2l(Mi), $:, i2l(S), $ , $U, $T, $C]};
+format_time_({{Y, M, D}, {H, Mi, S}}) ->
+    {[integer_to_list(Y), $-, i2l(M), $-, i2l(D)],
+     [i2l(H), $:, i2l(Mi), $:, i2l(S)]}.
+
+i2l(I) when I < 10  -> [$0, $0+I];
+i2l(I)              -> integer_to_list(I).
+i3l(I) when I < 100 -> [$0 | i2l(I)];
+i3l(I)              -> integer_to_list(I).
+
+localtime_ms(Now) ->
+    {_, _, Micro} = Now,
+    {Date, {Hours, Minutes, Seconds}} = calendar:now_to_local_time(Now),
+    {Date, {Hours, Minutes, Seconds, Micro div 1000 rem 1000}}.
+
+maybe_utc({Date, {H, M, S, Ms}}) ->
+    case maybe_utc_({Date, {H, M, S}}) of
+        {utc, {Date1, {H1, M1, S1}}} ->
+            {utc, {Date1, {H1, M1, S1, Ms}}};
+        {Date1, {H1, M1, S1}} ->
+            {Date1, {H1, M1, S1, Ms}}
+    end.
+
+maybe_utc_(Time) ->
+    UTC = case application:get_env(sasl, utc_log) of
+        {ok, Val} ->
+            Val;
+        undefined ->
+            %% Backwards compatible:
+            application:get_env(stdlib, utc_log, false)
+    end,
+    if
+        UTC =:= true ->
+            UTCTime = case calendar:local_time_to_universal_time_dst(Time) of
+                []     -> calendar:local_time();
+                [T0|_] -> T0
+            end,
+            {utc, UTCTime};
+        true ->
+            Time
+    end.
+
+%% ==================================================================
