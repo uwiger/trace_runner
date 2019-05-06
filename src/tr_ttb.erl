@@ -33,7 +33,21 @@
 -type trace_pat() :: any().
 -type pattern() :: {module(), atom(), arity(), trace_pat()}.
 
--callback flags() -> [{atom(), any()}].
+-type proc() :: pid() | port() | atom() | {global,any()}
+              | all | processes | ports | existing | existing_processes
+              | existing_ports | new | new_processes | new_ports.
+-type procs() :: proc() | [proc()].
+
+-type flag() :: clear | all
+              | m | s | r | c | call | p | sos | sol | sofs | sofl
+              | send | 'receive' | call | procs | ports | garbage_collection
+              | running | set_on_spawn | set_on_first_spawn | set_on_link
+              | set_on_first_link | timestamp | monotonic_timestamp
+              | strict_monotonic_timestamp | arity | return_to | silent
+              | running_procs | running_ports | exiting.
+-type flags() :: flag() | [flag()].
+
+-callback flags() -> {procs(), flags()}.
 -callback patterns() -> [pattern()].
 
 
@@ -54,12 +68,16 @@ on_nodes(Ns, File, Mod) ->
                 cb(Mod, flags, [], default_flags()),
                 [{mod, Mod}, {file, File}]).
 
+-spec on_nodes([node()], [pattern()], {procs(), flags()}, list()) ->
+                      {ok,list()} | {error, any()}.
 on_nodes(Ns, Patterns, Flags, Opts) ->
     ttb:start_trace(Ns, Patterns, Flags, lists:keydelete(mod, 1, Opts)).
 
+-spec default_patterns() -> [pattern()].
 default_patterns() ->
     [{?MODULE     , event, 3, []}].
 
+-spec default_flags() -> {procs(), flags()}.
 default_flags() ->
     {all, call}.
 
@@ -268,7 +286,7 @@ pp(Term, Col, Mod) ->
                          {record_print_fun, record_print_fun(Mod)}]).
 
 pp_term(D) when element(1,D) == dict ->
-    try {'$dict', dict:to_list(D)}
+    try {'$dict', dict_to_list(D)}
     catch
         error:_ ->
             list_to_tuple([pp_term(T) || T <- tuple_to_list(D)])
@@ -376,7 +394,12 @@ ensure_loaded(Mod) ->
             false
     end.
 
+%% -dialyzer(no_opaque).
+-dialyzer([{nowarn_function, dict_to_list/1}, no_opaque]).
+dict_to_list(D) when element(1, D) == dict ->
+    dict:to_list(D).
 
+-dialyzer({nowarn_function, format_time_/1}).
 %% ==================================================================
 %% Copied from lager_default_formatter.erl, lager_util.erl
 
