@@ -163,7 +163,7 @@ handler(Fd, Trace, TI, Acc) ->
     try Res = handler_(Fd, Trace, TI, Acc),
          Res
     catch
-        Caught:E:ST ->
+        Caught:E:ST when E =/= limit_exceeded ->
             fwrite(user, "CAUGHT ~p:~p:~p~n", [Caught, E, ST]),
             Acc
     end.
