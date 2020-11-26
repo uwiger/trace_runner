@@ -159,11 +159,15 @@ dhandler(end_of_trace, St) ->
 dhandler(Trace, #{fd := Fd} = St) ->
     handler(Fd, Trace, [], St).
 
+handler(_, _, _, #{limit_exceeded := true} = Acc) ->
+    Acc;
 handler(Fd, Trace, TI, Acc) ->
     try Res = handler_(Fd, Trace, TI, Acc),
          Res
     catch
-        Caught:E:ST when E =/= limit_exceeded ->
+        error:limit_exceeded ->
+            Acc#{limit_exceeded => true};
+        Caught:E:ST ->
             fwrite(user, "CAUGHT ~p:~p:~p~n", [Caught, E, ST]),
             Acc
     end.
