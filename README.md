@@ -116,5 +116,99 @@ record_fields(component_spec)	-> record_info(fields, component_spec);
 record_fields(_)		-> no.
 ```
 
+## Custom formatting of terms
+
+The pretty-printer allows terms to be custom-formatted using a `pp_term(Term)` callback,
+optionally exported from the callback module. The semantics of the callback is:
+
+```erlang
+pp_term(Term) -> {yes, Term1} | no.
+```
+
+The custom formatting function can call on subsequent `pp_term/1` callbacks using
+the `trace_runner` helper function `tr_ttb:pp_term(Term, Mod) -> Term1`.
+The helper unwraps any `{yes, ...}` tuples etc., returning either a modified term
+or the original term.
+
+Instead of a callback module, `tr_ttb:pp_term/2` can take a fun as second argument.
+Technically, the implementation is:
+
+```erlang
+pp_term(T, M) when is_atom(M) ->
+    pp_term(T, fun M:pp_term/1);
+pp_term(T, F) when is_function(F, 1) ->
+    try F(T) of
+        {yes, Out} ->
+            Out;
+        no         -> pp_term_(T, F)
+    catch
+        error:_ ->
+            pp_term_(T, F)
+    end.
+```
+
+... where `pp_term_/2` traverses the term, looking for opportunities to pretty-print
+sub-terms. That is, by returning `no`, the callback allows the traversal to continue.
+If it is known that no opportunities to pretty-print exist in a subterm, returning
+`{yes, Term}` will stop further inspection in that area.
+
+As an example of how layered pretty-printing can be leveraged, see the pretty-printing
+of Merkle Patricia Trees (MPT) in the Aeternity system. MPTs are particularly hard
+to read in raw form, partly since terms are encoded twice. The `pp_term/1` callbacks
+at the application level therefore first call on a generic helper function, which
+converts a tree to a key-value list, then applies application-specific decoding of
+the stored terms. Note the trick to tag custom-formatted terms with `'$...'` tags,
+both to help the reader and to allow higher levels to detect and further refine
+the data.
+
+```erlang
+record_fields(_) -> {check_mods, [ aec_accounts ]}.
+
+pp_term(Term) ->
+    aeu_mp_trees:tree_pp_term(Term, '$accounts', fun aec_accounts:deserialize/2).
+```
+
+The helper function:
+```erlang
+%% Utility trace support for state tree modules
+%%
+tree_pp_term(#mpt{} = Term, CacheTag, XForm) ->
+    Dec = fun(X) -> pp_mpt_decode(X, CacheTag, XForm) end,
+    {yes, tr_ttb:pp_term(tr_ttb:pp_term(Term, aeu_mtrees), Dec)};
+tree_pp_term(_, _, _) ->
+    no.
+
+pp_mpt_decode({'$mpt', L}, Tag, XForm) ->
+    {yes, {Tag, [{K, XForm(K, V)}
+                 || {K, V} <- L]}};
+pp_mpt_decode(_, _, _) ->
+    no.
+```
+
+## Record pretty-printing
+
+The pretty-printer uses a generalized version of the `record_print_fun` used in
+`io_lib_pretty.erl`. This way, `record_fields(Term)` can be exported from the
+callback module. In addition to the normal `{yes, FieldNames} | no` returns,
+the callbacks can also return `{check_mods, Modules}`, instructing the caller
+to inspect any `record_fields/1` callbacks of the listed modules.
+
+## Shell tracing
+
+Shell tracing can make use of the same instrumented pretty-printing via the
+function `tr_ttb:dbg_tracer(Options)` function. This starts a `dbg` tracer
+which calls on the pretty-printing callbacks described above. As formatting
+is likely to be slower, it is recommended that tracing is stopped using the
+function `tr_ttb:dbg_stop()`, which waits until the tracer process has processed
+queued trace messages before stopping it.
+
+The optional `Options` argument is a map, and supports the following options:
+```
+fd           - the output descriptor. Defaults to 'user'
+print_header - whether to print the preamble mainly meant for emacs. Defaults to 'false'
+limit        - How many lines of trace output to print. Defaults to 'infinity'
+time_resolution - millisecond | microsecond. Defaults to 'millisecond'
+```
+
 In the future, more log formatting options may be added.
 Pull requests are welcome.
