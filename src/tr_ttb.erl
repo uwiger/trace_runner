@@ -36,6 +36,8 @@
          record_print_fun/1
         ]).
 
+-export([ shell_records_tab/0 ]).
+
 -type trace_pat() :: any().
 -type pattern() :: {module(), atom(), arity(), trace_pat()}.
 
@@ -69,13 +71,46 @@ dbg_tracer() ->
     dbg_tracer(#{}).
 
 dbg_tracer(Opts) when is_map(Opts) ->
-    St0 = init_state(maps:merge(#{ fd => user
+    St0 = init_state(maps:merge(#{ fd => group_leader()
                                  , print_header => false }, Opts)),
     dbg:tracer(process, {fun dhandler/2, St0}).
 
 dbg_stop() ->
     await_traces(),
     dbg:stop().
+
+shell_records_tab() ->
+    case find_shell_process() of
+        ShellPid when is_pid(ShellPid) ->
+            case [T || T <- ets:all(),
+                       ets:info(T, owner) == ShellPid
+                           andalso ets:info(T, name) == shell_records] of
+                [RecTab] ->
+                    RecTab;
+                [] ->
+                    undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+find_shell_process() ->
+    find_shell_process(group_leader()).
+
+find_shell_process(GL) ->
+    case lists:keyfind(shell, 1, pi(GL, dictionary)) of
+        {_, Pid} ->
+            Pid;
+        false ->
+            case pi(GL, group_leader) of
+                GL  -> undefined;
+                GL1 -> find_shell_process(GL1)
+            end
+    end.
+
+pi(P, Key) when is_pid(P) ->
+    {_, I} = process_info(P, Key),
+    I.
 
 await_traces() ->
     case dbg:get_tracer() of
@@ -146,12 +181,25 @@ format_opts(OutFile, Opts0) ->
     Opts = maps:merge(#{limit => 10000}, Opts0),
     [{out, OutFile}, {handler, {fun handler/4, init_state(Opts)}}].
 
-init_state(Opts) ->
-    maps:merge(#{ ts    => 0
-                , diff  => 0
-                , limit => infinity
-                , sofar => 0
-                , opts  => Opts }, Opts).
+init_state(Opts0) ->
+    Opts = maps:merge(#{ ts    => 0
+                       , diff  => 0
+                       , limit => infinity
+                       , sofar => 0
+                       , opts  => Opts0 }, Opts0),
+    case Opts of
+        #{shell_records := true, shell_records_tab := _} ->
+            Opts;
+        #{shell_records := true} ->
+            case shell_records_tab() of
+                undefined ->
+                    maps:without([shell_records, shell_records_tab], Opts);
+                Tab ->
+                    Opts#{shell_records_tab => Tab}
+            end;
+        _ ->
+            Opts
+    end.
 
 %% Real-time handler (see dbg_tracer/1
 dhandler(end_of_trace, St) ->
@@ -159,6 +207,9 @@ dhandler(end_of_trace, St) ->
 dhandler(Trace, #{fd := Fd} = St) ->
     handler(Fd, Trace, [], St).
 
+handler(Fd, Trace, TI, #{delay := D} = Acc) ->
+    timer:sleep(D),
+    handler(Fd, Trace, TI, maps:remove(delay, Acc));
 handler(_, _, _, #{limit_exceeded := true} = Acc) ->
     Acc;
 handler(Fd, Trace, TI, Acc) ->
@@ -194,11 +245,11 @@ handler_(Fd, Trace, _, #{ts := TSp, diff := Diff, sofar := Sofar} = Acc) ->
         case Trace of
             {trace_ts, From, call, {Mod, Fun, Args}, TS} ->
                 {Pid, Node} = pid_and_node(From),
-                print_call(Fd, Pid, Node, Mod, Fun, Args, Diff1);
+                print_call(Fd, Pid, Node, Mod, Fun, Args, Diff1, Acc);
             {trace_ts, From, Type, {Mod, Fun, Arity}, Info, TS}
               when Type =:= return_from; Type =:= exception_from ->
                 {Pid, Node} = pid_and_node(From),
-                print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, Diff1);
+                print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, Diff1, Acc);
             TraceTS when element(1, TraceTS) == trace_ts ->
                 fwrite(Fd, "~p~n", [Trace]);
             _ ->
@@ -252,10 +303,10 @@ ts(_, 0) ->
 ts(_, TSp) ->
     TSp.
 
-print_call(Fd, Pid, Node, Mod, Fun, Args, Diff) ->
+print_call(Fd, Pid, Node, Mod, Fun, Args, Diff, Acc) ->
     case {Fun, Args} of
         {event, [Line, Evt, State]} when is_integer(Line) ->
-            Lines = print_evt(Fd, Pid, Node, Mod, Line, Evt, State, Diff),
+            Lines = print_evt(Fd, Pid, Node, Mod, Line, Evt, State, Diff, Acc),
             case get_pids({Evt, State}) of
                 [] -> Lines;
                 Pids ->
@@ -263,19 +314,19 @@ print_call(Fd, Pid, Node, Mod, Fun, Args, Diff) ->
                     Lines + Lines1
             end;
         _ ->
-            print_call_(Fd, Pid, Node, Mod, Fun, Args, Diff)
+            print_call_(Fd, Pid, Node, Mod, Fun, Args, Diff, Acc)
     end.
 
-print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, T) ->
+print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, T, Acc) ->
     Tstr = fwrite("~w", [T]),
     Indent = iolist_size(Tstr) + 3 + 4,
     Head = print_return_head(Type, Pid, Node, Mod, Fun, Arity),
     Line1Len = iolist_size([Tstr, Head]),
-    InfoPP = pp(Info, 1, Mod),
+    InfoPP = pp(Info, 1, Mod, Acc),
     Res = case fits_on_line(InfoPP, Line1Len, 79) of  %% minus space
               true  -> [" ", InfoPP];
               false ->
-                  ["\n", indent(Indent), pp(Info, Indent, Mod)]
+                  ["\n", indent(Indent), pp(Info, Indent, Mod, Acc)]
           end,
     io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, Res]}, nl]).
 
@@ -285,7 +336,7 @@ typestr(exception_from) -> "xx~~>".
 
 -define(CHAR_MAX, 60).
 
-print_evt(Fd, Pid, N, Mod, L, E, St, T) ->
+print_evt(Fd, Pid, N, Mod, L, E, St, T, Acc) ->
     Tstr = fwrite("~w", [T]),
     Indent = iolist_size(Tstr) + 3,
     Head = case N of
@@ -293,21 +344,21 @@ print_evt(Fd, Pid, N, Mod, L, E, St, T) ->
                _     -> fwrite(" - ~w~w|~w/~w: ", [Pid, N, Mod, L])
            end,
     EvtCol = iolist_size(Head) + 1,
-    EvtCs = pp(E, EvtCol, Mod),
+    EvtCs = pp(E, EvtCol, Mod, Acc),
     io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, EvtCs]}, nl
-                 | print_tail(St, Mod, Indent)]).
+                 | print_tail(St, Mod, Indent, Acc)]).
 
-print_call_(Fd, Pid, N, Mod, Fun, Args, T) ->
+print_call_(Fd, Pid, N, Mod, Fun, Args, T, Acc) ->
     Tstr = fwrite("~w", [T]),
     Indent = iolist_size(Tstr) + 3 + 4,
     Head = print_call_head(Pid, N, Mod, Fun),
     Line1Len = iolist_size([Tstr, Head]),
-    PlainArgs = rm_brackets(pp(Args, 1, Mod)),
+    PlainArgs = rm_brackets(pp(Args, 1, Mod, Acc)),
     Rest = case fits_on_line(PlainArgs, Line1Len, 79) of %% minus )
                true -> [PlainArgs, ")"];
                false ->
                    ["\n", indent(Indent),
-                    rm_brackets(pp(Args, Indent, Mod)), ")"]
+                    rm_brackets(pp(Args, Indent, Mod, Acc)), ")"]
            end,
     io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, Rest]}, nl]).
 
@@ -350,19 +401,22 @@ has_no_line_breaks(IOL) ->
     nomatch =:= re:run(IOL, <<"\\v">>).
 
 
-print_tail(none, _, _Col) -> [];
-print_tail(St, Mod, Col) ->
-    Cs = pp(St, Col+1, Mod),
+print_tail(none, _, _Col, _Acc) -> [];
+print_tail(St, Mod, Col, Acc) ->
+    Cs = pp(St, Col+1, Mod, Acc),
     [{put_chars, unicode, [lists:duplicate(Col,$\s), Cs]}, nl].
 
 pp(Term, Col, Mod) ->
+    pp(Term, Col, Mod, #{}).
+
+pp(Term, Col, Mod, Acc) ->
     Out = pp_term(Term, Mod),
     io_lib_pretty:print(Out,
                         [{column, Col},
                          {line_length, 80},
                          {depth, -1},
                          {max_chars, ?CHAR_MAX},
-                         {record_print_fun, record_print_fun(Mod)}]).
+                         {record_print_fun, record_print_fun(Mod, Acc)}]).
 
 pp_term(T, M) when is_atom(M) ->
     pp_term(T, fun M:pp_term/1);
@@ -404,35 +458,68 @@ time_resolution(Opts) ->
     maps:get(time_resolution, Opts, millisecond).
 
 record_print_fun(Mod) ->
+    record_print_fun(Mod, #{}).
+
+record_print_fun(Mod, Acc) ->
     fun(Tag, NoFields) ->
-            record_print_fun_(Mod, Tag, NoFields, [])
+            record_print_fun_(Mod, Tag, NoFields, [], Acc)
     end.
 
-record_print_fun_(Mod, Tag, NoFields, V) ->
-    try Mod:record_fields(Tag) of
+record_print_fun_(Mod, Tag, NoFields, V, Acc) ->
+    case shell_record_print(Tag, NoFields, Acc) of
         Fields when is_list(Fields) ->
-            case length(Fields) of
-                NoFields -> Fields;
-                _ -> no
-            end;
-        {check_mods, Mods} when is_list(Mods) ->
-            check_mods(Mods, Tag, NoFields, V);
-        no -> no
-    catch
-        _:_ ->
-            no
+            Fields;
+        _ ->
+            try Mod:record_fields(Tag) of
+                Fields when is_list(Fields) ->
+                    case length(Fields) of
+                        NoFields -> Fields;
+                        _ -> no
+                    end;
+                {check_mods, Mods} when is_list(Mods) ->
+                    check_mods(Mods, Tag, NoFields, V, Acc);
+                no -> no
+            catch
+                _:_ ->
+                    no
+            end
     end.
 
-check_mods([], _, _, _) ->
+%% code copied and slightly modified from shell:record_print_fun/1
+shell_record_print(Tag, NoFields, #{shell_records_tab := RT}) ->
+    try ets:lookup(RT, Tag) of
+        [{_,{attribute,_,record,{Tag,Fields}}}]
+          when length(Fields) =:= NoFields ->
+            record_fields(Fields);
+        _ ->
+            no
+    catch
+        error:_ ->
+            no
+    end;
+shell_record_print(_, _, _) ->
+    no.
+
+record_fields([{record_field,_,{atom,_,Field}} | Fs]) ->
+    [Field | record_fields(Fs)];
+record_fields([{record_field,_,{atom,_,Field},_} | Fs]) ->
+    [Field | record_fields(Fs)];
+record_fields([{typed_record_field,Field,_Type} | Fs]) ->
+    record_fields([Field | Fs]);
+record_fields([]) ->
+    [].
+
+
+check_mods([], _, _, _, _) ->
     no;
-check_mods([M|Mods], Tag, NoFields, V) ->
-    Cont = fun(V1) -> check_mods(Mods, Tag, NoFields, V1) end,
+check_mods([M|Mods], Tag, NoFields, V, Acc) ->
+    Cont = fun(V1) -> check_mods(Mods, Tag, NoFields, V1, Acc) end,
     case lists:member(M, V) of
         true ->
             Cont(V);
         false ->
             V1 = [M|V],
-            try record_print_fun_(M, Tag, NoFields, V1) of
+            try record_print_fun_(M, Tag, NoFields, V1, Acc) of
                 Fields when is_list(Fields) ->
                     Fields;
                 no ->
