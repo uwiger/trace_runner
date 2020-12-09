@@ -204,11 +204,17 @@ queued trace messages before stopping it.
 
 The optional `Options` argument is a map, and supports the following options:
 ```
-fd           - the output descriptor. Defaults to 'user'
+fd           - the output descriptor. Defaults to the group_leader of the current process
 print_header - whether to print the preamble mainly meant for emacs. Defaults to 'false'
 limit        - How many lines of trace output to print. Defaults to 'infinity'
 time_resolution - millisecond | microsecond. Defaults to 'millisecond'
+delay        - The trace handler will sleep for the given number of milliseconds
+shell_records - If possible, records definitions stored in the shell via `rr(Mod)` will be used
 ```
+
+The `delay` option, e.g. `delay => 1000` causes a sleep when encountered. The option is then removed
+from the accumulator. A callback could then reinsert it for another sleep, although currently, there is
+no provision for user modification of the accumulator state.
 
 In the future, more log formatting options may be added.
 Pull requests are welcome.
