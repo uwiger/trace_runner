@@ -12,6 +12,10 @@
 
 -export([ event/1 ]).
 
+-export([ dbg_tracer/0
+        , dbg_tracer/1
+        , dbg_stop/0 ]).
+
 -export([
          on_nodes/2,
          on_nodes/3,
@@ -27,8 +31,12 @@
          format_opts/1,
          handler/4,
          pp/3,
+         pp_term/2,           %% (Term, Module | F((T) -> {yes, T1} | no)) -> Term1
+         pp_custom/3,         %% (Term, Tag, Fmt((X) -> X1)) -> Term1
          record_print_fun/1
         ]).
+
+-export([ shell_records_tab/0 ]).
 
 -type trace_pat() :: any().
 -type pattern() :: {module(), atom(), arity(), trace_pat()}.
@@ -58,6 +66,66 @@ event(E) ->
 
 event(_, _, _) ->
     ok.
+
+dbg_tracer() ->
+    dbg_tracer(#{}).
+
+dbg_tracer(Opts) when is_map(Opts) ->
+    St0 = init_state(maps:merge(#{ fd => group_leader()
+                                 , print_header => false }, Opts)),
+    dbg:tracer(process, {fun dhandler/2, St0}).
+
+dbg_stop() ->
+    await_traces(),
+    dbg:stop().
+
+shell_records_tab() ->
+    case find_shell_process() of
+        ShellPid when is_pid(ShellPid) ->
+            case [T || T <- ets:all(),
+                       ets:info(T, owner) == ShellPid
+                           andalso ets:info(T, name) == shell_records] of
+                [RecTab] ->
+                    RecTab;
+                [] ->
+                    undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+find_shell_process() ->
+    find_shell_process(group_leader()).
+
+find_shell_process(GL) ->
+    case lists:keyfind(shell, 1, pi(GL, dictionary)) of
+        {_, Pid} ->
+            Pid;
+        false ->
+            case pi(GL, group_leader) of
+                GL  -> undefined;
+                GL1 -> find_shell_process(GL1)
+            end
+    end.
+
+pi(P, Key) when is_pid(P) ->
+    {_, I} = process_info(P, Key),
+    I.
+
+await_traces() ->
+    case dbg:get_tracer() of
+        {ok, Tracer} ->
+            await_tracer(process_info(Tracer, message_queue_len), Tracer);
+        {error, _} ->
+            ok
+    end.
+
+await_tracer({message_queue_len, L}, Tracer) when L > 3 ->
+    timer:sleep(10),
+    await_tracer(process_info(Tracer, message_queue_len), Tracer);
+await_tracer(_, _) ->
+    ok.
+
 
 on_nodes(Ns, File) ->
     on_nodes(Ns, default_patterns(), default_flags(), [{file, File}]).
@@ -92,56 +160,96 @@ format(Dir) ->
     format(Dir, standard_io).
 
 format(Dir, OutFile) ->
-    format(Dir, OutFile, default_opts()).
+    format(Dir, OutFile, #{}).
 
 format(Dir, OutFile, Opts) ->
     try ttb:format(Dir, format_opts(OutFile, Opts))
     catch
         error:exceeded_limit = Reason ->
             {error, Reason};
-        error:Other ->
-            {error, {Other, erlang:get_stacktrace()}}
+        error:Other:ST ->
+            {error, {Other, ST}}
     end.
 
 format_opts() ->
     format_opts(standard_io).
 
 format_opts(Outfile) ->
-    format_opts(Outfile, default_opts()).
+    format_opts(Outfile, #{}).
 
-format_opts(OutFile, Opts) ->
-    Limit = maps:get(limit, Opts, infinity),
-    [{out, OutFile}, {handler, {fun handler/4, #{ts => 0,
-                                                 diff => 0,
-                                                 sofar => 0,
-                                                 limit => Limit,
-                                                 opts => Opts}}}].
+format_opts(OutFile, Opts0) ->
+    Opts = maps:merge(#{limit => 10000}, Opts0),
+    [{out, OutFile}, {handler, {fun handler/4, init_state(Opts)}}].
 
-default_opts() ->
-    #{limit => 10000}.
+init_state(Opts0) ->
+    Opts = maps:merge(#{ ts    => 0
+                       , diff  => 0
+                       , limit => infinity
+                       , sofar => 0
+                       , opts  => Opts0 }, Opts0),
+    case Opts of
+        #{shell_records := true, shell_records_tab := _} ->
+            Opts;
+        #{shell_records := true} ->
+            case shell_records_tab() of
+                undefined ->
+                    maps:without([shell_records, shell_records_tab], Opts);
+                Tab ->
+                    Opts#{shell_records_tab => Tab}
+            end;
+        _ ->
+            Opts
+    end.
 
+%% Real-time handler (see dbg_tracer/1
+dhandler(end_of_trace, St) ->
+    St;
+dhandler(Trace, #{fd := Fd} = St) ->
+    handler(Fd, Trace, [], St).
 
+handler(Fd, Trace, TI, #{delay := D} = Acc) ->
+    timer:sleep(D),
+    handler(Fd, Trace, TI, maps:remove(delay, Acc));
+handler(_, _, _, #{limit_exceeded := true} = Acc) ->
+    Acc;
+handler(Fd, Trace, TI, Acc) ->
+    try Res = handler_(Fd, Trace, TI, Acc),
+         Res
+    catch
+        error:limit_exceeded ->
+            Acc#{limit_exceeded => true};
+        Caught:E:ST ->
+            fwrite(user, "CAUGHT ~p:~p:~p~n", [Caught, E, ST]),
+            Acc
+    end.
 
-handler(Fd, Trace, _, #{ts := TSp, diff := Diff, sofar := Sofar} = Acc) ->
+handler_(Fd, Trace, _, #{ts := TSp, diff := Diff, sofar := Sofar} = Acc) ->
     TS = ts(Trace, TSp),
     L0 = case {TSp,Diff} of {0,0} ->
-                 io:fwrite(Fd, "%% -*- erlang -*-~n", []),
-                 io:put_chars(Fd, format_time(TS)),
-                 2;
+                 case maps:get(print_header, Acc, true) of
+                     true ->
+                         io:fwrite(Fd, "%% -*- erlang -*-~n", []),
+                         io:put_chars(Fd, format_time(TS)),
+                         2;
+                     _ ->
+                         0
+                 end;
              _ -> 0
          end,
-    Tdiff = tdiff(TS, TSp),
+    Tdiff = tdiff(TS, TSp, time_resolution(Acc)),
     Diff1 = Diff + Tdiff,
     Sofar1 = Sofar + L0,
     Acc1 = Acc#{sofar => Sofar1, ts => TS, diff => Diff1},
     check_limit_exceeded(Acc1),
     Lines =
         case Trace of
-            {trace_ts,{Pid, _, Node}, call, {Mod, Fun, Args}, TS} ->
-                print_call(Fd, Pid, Node, Mod, Fun, Args, Diff1);
-            {trace_ts,{Pid, _, Node}, Type, {Mod, Fun, Arity}, Info, TS}
+            {trace_ts, From, call, {Mod, Fun, Args}, TS} ->
+                {Pid, Node} = pid_and_node(From),
+                print_call(Fd, Pid, Node, Mod, Fun, Args, Diff1, Acc);
+            {trace_ts, From, Type, {Mod, Fun, Arity}, Info, TS}
               when Type =:= return_from; Type =:= exception_from ->
-                print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, Diff1);
+                {Pid, Node} = pid_and_node(From),
+                print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, Diff1, Acc);
             TraceTS when element(1, TraceTS) == trace_ts ->
                 fwrite(Fd, "~p~n", [Trace]);
             _ ->
@@ -149,8 +257,13 @@ handler(Fd, Trace, _, #{ts := TSp, diff := Diff, sofar := Sofar} = Acc) ->
         end,
     Acc1#{sofar => Sofar1 + Lines}.
 
+pid_and_node({Pid, _, Node}) ->
+    {Pid, Node};
+pid_and_node(Pid) when is_pid(Pid) ->
+    {Pid, local}.
+
 fwrite(Fd, Fmt, Args) ->
-    io_reqs(Fd, [{put_chars, io_lib:fwrite(Fmt, Args)}]).
+    io_reqs(Fd, [{put_chars, fwrite(Fmt, Args)}]).
 
 io_reqs(Fd, Rs) ->
     Lines = count_lines(Rs),
@@ -185,15 +298,15 @@ check_limit_exceeded(#{sofar := Sofar, limit := Limit}) ->
 ts(Trace, _TSp) when element(1, Trace) == trace_ts ->
     Sz = tuple_size(Trace),
     element(Sz, Trace);
+ts(_, 0) ->
+    erlang:timestamp();
 ts(_, TSp) ->
     TSp.
 
-
-
-print_call(Fd, Pid, Node, Mod, Fun, Args, Diff) ->
+print_call(Fd, Pid, Node, Mod, Fun, Args, Diff, Acc) ->
     case {Fun, Args} of
         {event, [Line, Evt, State]} when is_integer(Line) ->
-            Lines = print_evt(Fd, Pid, Node, Mod, Line, Evt, State, Diff),
+            Lines = print_evt(Fd, Pid, Node, Mod, Line, Evt, State, Diff, Acc),
             case get_pids({Evt, State}) of
                 [] -> Lines;
                 Pids ->
@@ -201,20 +314,19 @@ print_call(Fd, Pid, Node, Mod, Fun, Args, Diff) ->
                     Lines + Lines1
             end;
         _ ->
-            print_call_(Fd, Pid, Node, Mod, Fun, Args, Diff)
+            print_call_(Fd, Pid, Node, Mod, Fun, Args, Diff, Acc)
     end.
 
-print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, T) ->
-    Tstr = io_lib:fwrite("~w", [T]),
+print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, T, Acc) ->
+    Tstr = fwrite("~w", [T]),
     Indent = iolist_size(Tstr) + 3 + 4,
-    Head = io_lib:fwrite(" - ~w~w|~w:~w/~w " ++ typestr(Type),
-                         [Pid, Node, Mod, Fun, Arity]),
+    Head = print_return_head(Type, Pid, Node, Mod, Fun, Arity),
     Line1Len = iolist_size([Tstr, Head]),
-    InfoPP = pp(Info, 1, Mod),
+    InfoPP = pp(Info, 1, Mod, Acc),
     Res = case fits_on_line(InfoPP, Line1Len, 79) of  %% minus space
               true  -> [" ", InfoPP];
               false ->
-                  ["\n", indent(Indent), pp(Info, Indent, Mod)]
+                  ["\n", indent(Indent), pp(Info, Indent, Mod, Acc)]
           end,
     io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, Res]}, nl]).
 
@@ -224,29 +336,46 @@ typestr(exception_from) -> "xx~~>".
 
 -define(CHAR_MAX, 60).
 
-print_evt(Fd, Pid, N, Mod, L, E, St, T) ->
-    Tstr = io_lib:fwrite("~w", [T]),
+print_evt(Fd, Pid, N, Mod, L, E, St, T, Acc) ->
+    Tstr = fwrite("~w", [T]),
     Indent = iolist_size(Tstr) + 3,
-    Head = io_lib:fwrite(" - ~w~w|~w/~w: ", [Pid, N, Mod, L]),
+    Head = case N of
+               local -> fwrite(" - ~w|~w/~w: "  , [Pid, Mod, L]);
+               _     -> fwrite(" - ~w~w|~w/~w: ", [Pid, N, Mod, L])
+           end,
     EvtCol = iolist_size(Head) + 1,
-    EvtCs = pp(E, EvtCol, Mod),
+    EvtCs = pp(E, EvtCol, Mod, Acc),
     io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, EvtCs]}, nl
-                 | print_tail(St, Mod, Indent)]).
+                 | print_tail(St, Mod, Indent, Acc)]).
 
-print_call_(Fd, Pid, N, Mod, Fun, Args, T) ->
-    Tstr = io_lib:fwrite("~w", [T]),
+print_call_(Fd, Pid, N, Mod, Fun, Args, T, Acc) ->
+    Tstr = fwrite("~w", [T]),
     Indent = iolist_size(Tstr) + 3 + 4,
-        %% + (iolist_size(io_lib:fwrite("~w", [N])) div 2),
-    Head = io_lib:fwrite(" - ~w~w|~w:~w(", [Pid, N, Mod, Fun]),
+    Head = print_call_head(Pid, N, Mod, Fun),
     Line1Len = iolist_size([Tstr, Head]),
-    PlainArgs = rm_brackets(pp(Args, 1, Mod)),
+    PlainArgs = rm_brackets(pp(Args, 1, Mod, Acc)),
     Rest = case fits_on_line(PlainArgs, Line1Len, 79) of %% minus )
                true -> [PlainArgs, ")"];
                false ->
                    ["\n", indent(Indent),
-                    rm_brackets(pp(Args, Indent, Mod)), ")"]
+                    rm_brackets(pp(Args, Indent, Mod, Acc)), ")"]
            end,
     io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, Rest]}, nl]).
+
+print_call_head(Pid, N, Mod, Fun) ->
+    case N of
+        local -> fwrite(" - ~w|~w:~w("  , [Pid, Mod, Fun]);
+        _     -> fwrite(" - ~w~w|~w:~w(", [Pid, N, Mod, Fun])
+    end.
+
+print_return_head(Type, Pid, Node, Mod, Fun, Arity) ->
+    case Node of
+        local -> fwrite(" - ~w|~w:~w/~w "   ++ typestr(Type), [Pid, Mod, Fun, Arity]);
+        _     -> fwrite(" - ~w~w|~w:~w/~w " ++ typestr(Type), [Pid, Node, Mod, Fun, Arity])
+    end.
+
+fwrite(Fmt, Args) ->
+    io_lib:fwrite(Fmt, Args).
 
 indent(N) ->
     lists:duplicate(N, $\s).
@@ -272,67 +401,125 @@ has_no_line_breaks(IOL) ->
     nomatch =:= re:run(IOL, <<"\\v">>).
 
 
-print_tail(none, _, _Col) -> [];
-print_tail(St, Mod, Col) ->
-    Cs = pp(St, Col+1, Mod),
+print_tail(none, _, _Col, _Acc) -> [];
+print_tail(St, Mod, Col, Acc) ->
+    Cs = pp(St, Col+1, Mod, Acc),
     [{put_chars, unicode, [lists:duplicate(Col,$\s), Cs]}, nl].
 
 pp(Term, Col, Mod) ->
-    io_lib_pretty:print(pp_term(Term),
+    pp(Term, Col, Mod, #{}).
+
+pp(Term, Col, Mod, Acc) ->
+    Out = pp_term(Term, Mod),
+    io_lib_pretty:print(Out,
                         [{column, Col},
                          {line_length, 80},
                          {depth, -1},
                          {max_chars, ?CHAR_MAX},
-                         {record_print_fun, record_print_fun(Mod)}]).
+                         {record_print_fun, record_print_fun(Mod, Acc)}]).
 
-pp_term(D) when element(1,D) == dict ->
-    try {'$dict', dict_to_list(D)}
+pp_term(T, M) when is_atom(M) ->
+    pp_term(T, fun M:pp_term/1);
+pp_term(T, F) when is_function(F, 1) ->
+    try F(T) of
+        {yes, Out} ->
+            Out;
+        no         -> pp_term_(T, F)
     catch
         error:_ ->
-            list_to_tuple([pp_term(T) || T <- tuple_to_list(D)])
-    end;
-pp_term(T) when is_tuple(T) ->
-    list_to_tuple([pp_term(Trm) || Trm <- tuple_to_list(T)]);
-pp_term(L) when is_list(L) ->
-    [pp_term(T) || T <- L];
-pp_term(T) ->
+            pp_term_(T, F)
+    end.
+
+pp_term_(D, _) when element(1,D) == dict     -> pp_custom(D, '$dict', fun dict_to_list/1);
+pp_term_(T, M) when is_tuple(T) ->
+    list_to_tuple([pp_term(Trm, M) || Trm <- tuple_to_list(T)]);
+pp_term_(L, M) when is_list(L) ->
+    [pp_term(T, M) || T <- L];
+pp_term_(T, _) ->
     T.
 
-tdiff(_, 0) -> 0;
-tdiff(TS, T0) ->
-    %% time difference in milliseconds
-    timer:now_diff(TS, T0) div 1000.
+pp_custom(X, Tag, F) ->
+    try {Tag, F(X)}
+    catch
+        error:_ ->
+            {'ERROR-CUSTOM', Tag, X}
+    end.
+
+tdiff(_, 0, _) -> 0;
+tdiff(TS, T0, Res) ->
+    case Res of
+        millisecond ->
+            timer:now_diff(TS, T0) div 1000;
+        microsecond ->
+            timer:now_diff(TS, T0)
+    end.
+
+time_resolution(Opts) ->
+    maps:get(time_resolution, Opts, millisecond).
 
 record_print_fun(Mod) ->
+    record_print_fun(Mod, #{}).
+
+record_print_fun(Mod, Acc) ->
     fun(Tag, NoFields) ->
-            record_print_fun_(Mod, Tag, NoFields, [])
+            record_print_fun_(Mod, Tag, NoFields, [], Acc)
     end.
 
-record_print_fun_(Mod, Tag, NoFields, V) ->
-    try Mod:record_fields(Tag) of
+record_print_fun_(Mod, Tag, NoFields, V, Acc) ->
+    case shell_record_print(Tag, NoFields, Acc) of
         Fields when is_list(Fields) ->
-            case length(Fields) of
-                NoFields -> Fields;
-                _ -> no
-            end;
-        {check_mods, Mods} when is_list(Mods) ->
-            check_mods(Mods, Tag, NoFields, V);
-        no -> no
-    catch
-        _:_ ->
-            no
+            Fields;
+        _ ->
+            try Mod:record_fields(Tag) of
+                Fields when is_list(Fields) ->
+                    case length(Fields) of
+                        NoFields -> Fields;
+                        _ -> no
+                    end;
+                {check_mods, Mods} when is_list(Mods) ->
+                    check_mods(Mods, Tag, NoFields, V, Acc);
+                no -> no
+            catch
+                _:_ ->
+                    no
+            end
     end.
 
-check_mods([], _, _, _) ->
+%% code copied and slightly modified from shell:record_print_fun/1
+shell_record_print(Tag, NoFields, #{shell_records_tab := RT}) ->
+    try ets:lookup(RT, Tag) of
+        [{_,{attribute,_,record,{Tag,Fields}}}]
+          when length(Fields) =:= NoFields ->
+            record_fields(Fields);
+        _ ->
+            no
+    catch
+        error:_ ->
+            no
+    end;
+shell_record_print(_, _, _) ->
+    no.
+
+record_fields([{record_field,_,{atom,_,Field}} | Fs]) ->
+    [Field | record_fields(Fs)];
+record_fields([{record_field,_,{atom,_,Field},_} | Fs]) ->
+    [Field | record_fields(Fs)];
+record_fields([{typed_record_field,Field,_Type} | Fs]) ->
+    record_fields([Field | Fs]);
+record_fields([]) ->
+    [].
+
+
+check_mods([], _, _, _, _) ->
     no;
-check_mods([M|Mods], Tag, NoFields, V) ->
-    Cont = fun(V1) -> check_mods(Mods, Tag, NoFields, V1) end,
+check_mods([M|Mods], Tag, NoFields, V, Acc) ->
+    Cont = fun(V1) -> check_mods(Mods, Tag, NoFields, V1, Acc) end,
     case lists:member(M, V) of
         true ->
             Cont(V);
         false ->
             V1 = [M|V],
-            try record_print_fun_(M, Tag, NoFields, V1) of
+            try record_print_fun_(M, Tag, NoFields, V1, Acc) of
                 Fields when is_list(Fields) ->
                     Fields;
                 no ->
