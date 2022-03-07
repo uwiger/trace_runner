@@ -46,6 +46,7 @@
 
 -type trace_pat() :: any().
 -type pattern() :: {module(), atom(), arity(), trace_pat()}.
+-type patterns() :: [pattern()].
 
 -type proc() :: pid() | port() | atom() | {global,any()}
               | all | processes | ports | existing | existing_processes
