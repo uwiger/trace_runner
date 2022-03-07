@@ -36,7 +36,13 @@
          record_print_fun/1
         ]).
 
+-export([ cfg/3 ]).
+
 -export([ shell_records_tab/0 ]).
+
+-export_type([ flag/0, flags/0,
+               pattern/0, patterns/0,
+               proc/0 ]).
 
 -type trace_pat() :: any().
 -type pattern() :: {module(), atom(), arity(), trace_pat()}.
@@ -58,6 +64,7 @@
 -callback flags() -> {procs(), flags()}.
 -callback patterns() -> [pattern()].
 
+-define(EVENT(E, S), event(?LINE, E, S)).
 
 %% This function is also traced. Can be used to insert markers in the trace
 %% log.
@@ -130,16 +137,45 @@ await_tracer(_, _) ->
 on_nodes(Ns, File) ->
     on_nodes(Ns, default_patterns(), default_flags(), [{file, File}]).
 
-on_nodes(Ns, File, Mod) ->
+on_nodes(Ns, File, Spec) ->
     on_nodes(Ns,
-                cb(Mod, patterns, [], default_patterns()),
-                cb(Mod, flags, [], default_flags()),
-                [{mod, Mod}, {file, File}]).
+                cfg(Spec, patterns, default_patterns()),
+                cfg(Spec, flags, default_flags()),
+                [ {file, File}
+                , {tr_ttb_info, cfg(Spec, info, undefined)}]).
 
 -spec on_nodes([node()], [pattern()], {procs(), flags()}, list()) ->
                       {ok,list()} | {error, any()}.
-on_nodes(Ns, Patterns, Flags, Opts) ->
-    ttb:start_trace(Ns, Patterns, Flags, lists:keydelete(mod, 1, Opts)).
+on_nodes(Ns, Patterns0, Flags, Opts0) ->
+    Opts = lists:keydelete(tr_ttb_info, 1, Opts0),
+    Patterns = expand_patterns(Patterns0),
+    Res = ttb:start_trace(Ns, Patterns, Flags, Opts),
+    ?EVENT(ttb_started, maybe_info(#{ nodes => Ns
+                                    , patterns => Patterns
+                                    , flags    => Flags }, Opts0)),
+    Res.
+
+maybe_info(Map, Opts) ->
+    case lists:keyfind(tr_ttb_info, 1, Opts) of
+        {_, Info} when Info =/= undefined ->
+            Map#{info => Info};
+        _ ->
+            Map
+    end.
+
+expand_patterns(Patterns) ->
+    [expand_pat(P) || P <- Patterns].
+
+expand_pat(P) when is_tuple(P) ->
+    Sz = tuple_size(P),
+    case element(Sz, P) of
+        x ->
+            setelement(Sz, P, [{'_',[],[{exception_trace}]}]);
+        _ ->
+            P
+    end;
+expand_pat(P) ->
+    P.
 
 -spec default_patterns() -> [pattern()].
 default_patterns() ->
@@ -250,6 +286,12 @@ handler_(Fd, Trace, _, #{ts := TSp, diff := Diff, sofar := Sofar} = Acc) ->
               when Type =:= return_from; Type =:= exception_from ->
                 {Pid, Node} = pid_and_node(From),
                 print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, Diff1, Acc);
+            {trace_ts, From, Type, Info, TS} ->
+                {Pid, Node} = pid_and_node(From),
+                print_other(Fd, #{type => Type}, Pid, Node, Info, Diff1, Acc);
+            {trace_ts, From, Type, Arg, Info, TS} ->
+                {Pid, Node} = pid_and_node(From),
+                print_other(Fd, #{type => Type, arg => Arg}, Pid, Node, Info, Diff1, Acc);
             TraceTS when element(1, TraceTS) == trace_ts ->
                 fwrite(Fd, "~p~n", [Trace]);
             _ ->
@@ -330,9 +372,38 @@ print_return(Fd, Type, Pid, Node, Mod, Fun, Arity, Info, T, Acc) ->
           end,
     io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, Res]}, nl]).
 
+print_other(Fd, Type, Pid, Node, Info, T, Acc) ->
+    Tstr = fwrite("~w", [T]),
+    Indent = iolist_size(Tstr) + 3 + 4,
+    Head = print_other_head(Pid, Node, Type),
+    Line1Len = iolist_size([Tstr, Head]),
+    Mod = guess_mod(Type, Info),
+    InfoPP = pp(Info, 1, Mod, Acc),
+    Res = case fits_on_line(InfoPP, Line1Len, 79) of
+              true -> [" ", InfoPP];
+              false ->
+                  ["\n", indent(Indent), pp(Info, Indent, Mod, Acc)]
+          end,
+    io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, Res]}, nl]).
+
 typestr(return_from   ) -> "->";
 typestr(exception_from) -> "xx~~>".
 
+guess_mod(Type, Info) ->
+    guess_mod(Type, Info, ?MODULE).
+
+guess_mod(#{type := exit}, {_, [{Mod, _, _}|_]}, Default) when is_atom(Mod) ->
+    case erlang:function_exported(Mod, module_info, 0) of
+        true -> Mod;
+        false -> Default
+    end;
+guess_mod(_, {erlang, apply, [Mod|_]}, _) when is_atom(Mod) ->
+    Mod;
+guess_mod(_, {erlang, apply, [F|_]}, _) when is_function(F) ->
+    {_, Mod} = erlang:fun_info(F, module),
+    Mod;
+guess_mod(_, _, Default) ->
+    Default.
 
 -define(CHAR_MAX, 60).
 
@@ -366,6 +437,17 @@ print_call_head(Pid, N, Mod, Fun) ->
     case N of
         local -> fwrite(" - ~w|~w:~w("  , [Pid, Mod, Fun]);
         _     -> fwrite(" - ~w~w|~w:~w(", [Pid, N, Mod, Fun])
+    end.
+
+print_other_head(Pid, N, #{type := Type, arg := Arg}) ->
+    case N of
+        local -> fwrite(" - ~w|~w[~w]:", [Pid, Type, Arg]);
+        _     -> fwrite(" - ~w~w|~w[~w]:", [Pid, N, Type, Arg])
+    end;
+print_other_head(Pid, N, #{type := Type}) ->
+    case N of
+        local -> fwrite(" - ~w|~w:", [Pid, Type]);
+        _     -> fwrite(" - ~w~w|~w", [Pid, N, Type])
     end.
 
 print_return_head(Type, Pid, Node, Mod, Fun, Arity) ->
@@ -422,21 +504,29 @@ pp_term(T, M) when is_atom(M) ->
     pp_term(T, fun M:pp_term/1);
 pp_term(T, F) when is_function(F, 1) ->
     try F(T) of
-        {yes, Out} ->
-            Out;
+        {yes, Out} -> Out;
         no         -> pp_term_(T, F)
     catch
         error:_ ->
             pp_term_(T, F)
     end.
 
-pp_term_(D, _) when element(1,D) == dict     -> pp_custom(D, '$dict', fun dict_to_list/1);
+pp_term_(D, _) when element(1, D) == dict ->
+    pp_custom(D, '$dict', fun dict_to_list/1);
 pp_term_(T, M) when is_tuple(T) ->
     list_to_tuple([pp_term(Trm, M) || Trm <- tuple_to_list(T)]);
 pp_term_(L, M) when is_list(L) ->
-    [pp_term(T, M) || T <- L];
+    %% Could be an improper list
+    lmap(L, fun(T) -> pp_term(T, M) end);
 pp_term_(T, _) ->
     T.
+
+lmap([H|T], F) when is_list(T) ->
+    [F(H)|lmap(T,F)];
+lmap([H|X], F) ->
+    [F(H)|F(X)];
+lmap([], _) ->
+    [].
 
 pp_custom(X, Tag, F) ->
     try {Tag, F(X)}
@@ -564,11 +654,24 @@ node_prefix(P) ->
             P
     end.
 
-cb(Mod, F, Args, Default) ->
+cfg(Mod, Key, Default) when is_atom(Mod) ->
+    try_callback(Mod, Key, [], Default);
+cfg(Spec, Key, Default) when is_map(Spec) ->
+    case maps:find(Key, Spec) of
+        {ok, Res} -> Res;
+        error ->
+            case maps:get(module, Spec, undefined) of
+                undefined -> Default;
+                Mod ->
+                    try_callback(Mod, Key, [], Default)
+            end
+    end.
+
+try_callback(Mod, Key, Args, Default) ->
     ensure_loaded(Mod),
-    case erlang:function_exported(Mod, F, length(Args)) of
+    case erlang:function_exported(Mod, Key, length(Args)) of
         true ->
-            apply(Mod, F, Args);
+            apply(Mod, Key, Args);
         false ->
             Default
     end.
