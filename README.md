@@ -1,5 +1,5 @@
 # trace_runner
-A wrapper for tracing test runs using TTB.
+A wrapper for tracing test runs and for complex shell-based tracing using TTB.
 
 This component is based on [locks_ttb](https://github.com/uwiger/locks/blob/master/src/locks_ttb.erl), whose main purpose was to be used in complicated
 multi-node test cases: a wrapper around the test case sets up a multi-node
@@ -10,12 +10,43 @@ The idea is complemented with the notion of using an `event()` function,
 whose only purpose is to be traced. This can serve as extremely lightweight
 runtime debugging statements. Since the `event()` function only returns
 `ok`, the whole operation is cheaper than any runtime test for debug level
-could be. the `include/trace_runner.hrl` include file defines `?event`
+could be. The `include/trace_runner.hrl` include file defines `?event`
 macros that can be used, including one that tests whether the `event()`
 function is traced, before evaluating the argument expression. This can
 be used to 'pretty-print' the arguments to the `event()` function without
 incurring overhead when not tracing (obviously there is *some* overhead in
 checking the trace status).
+
+There is also support for shell-based tracing, making use of the
+instrumentation callbacks e.g. for pretty-printing of trace output.
+
+## API
+
+The main API functions are:
+
+```erlang
+tr_ttb:on_nodes(Nodes, OutputFile, Spec) -> {ok, [{Item, MatchDesc}]}.
+```
+
+This function acts as a wrapper to [`ttb:start_trace/4`](https://www.erlang.org/doc/man/ttb.html#start_trace-4), and returns whatever
+that call returns. The `Spec` can be either a module name, where the module
+is expected to export some or all of the supported configuration callbacks
+(see below), or a map():
+
+```erlang
+-type spec() :: #{ patterns => [tr_ttb:pattern()]
+                 , flags    => {tr_ttb:procs(), tr_ttb:flags()},
+                 , collect  => on_error | always
+                 , info     => any() }
+```
+
+The `info` attribute is used for documentation purposes. If the trace
+includes tracing on `tr_ttb:event/3`, a trace message will be included
+showing `tr_ttb:event(_Line, ttb_started, Spec)`. The `tr_ct` trace
+wrapper, described below, uses the `info` attribute to signal where,
+at which checkpoint, the trace started.
+
+
 
 Example (from https://github.com/PDXOstc/rvi_core, although at the time of writing, the trace_runner support hasn't yet been merged)
 
@@ -57,6 +88,55 @@ t_multicall_sota_service_(_Config) ->
     Data = <<"abc">>,
     ...
 ```
+
+## Common Test wrapper
+
+The module `tr_ct` contains a wrapper function, `tr_ct:with_trace/3`,
+which calls the above `tr_ttb:on_nodes/3` at a chosen time, applies
+a test function, and fetches and pretty-prints the trace data if the
+test function fails. Note that if `collect => always`, fetching and 
+pretty-printing will happen even if the test case succeeds.
+
+Example, from [the mnesia_rocksdb project](https://github.com/aeternity/mnesia_rocksdb/blob/master/test/mnesia_rocksdb_SUITE.erl)
+
+```erlang
+mrdb_two_procs(Config) ->
+    tr_ct:with_trace(fun mrdb_two_procs_/1, Config,
+                     tr_flags(
+                       {self(), [call, sos, p]},
+                       tr_patterns(
+                         mrdb, [ {mrdb, insert, 2, x}
+                               , {mrdb, read, 2, x}
+                               , {mrdb, activity, x} ], tr_opts()))).
+
+mrdb_two_procs_(Config) ->
+    ....
+
+tr_opts() ->
+    #{patterns => [ {mrdb, '_', '_', x}
+                  , {mrdb_lib, '_', '_', x}
+                  , {tr_ttb, event, 3, []}
+                  , {?MODULE, go_ahead_other, 3, x}
+                  , {?MODULE, wait_for_other, 3, x}
+                  , {?MODULE, await_other_down, 3, x}
+                  , {?MODULE, do_when_p_allows, 4, x}
+                  , {?MODULE, allow_p, 3, x}
+                  ]}.
+
+tr_patterns(Mod, Ps, #{patterns := Pats} = Opts) ->
+    Pats1 = [P || P <- Pats, element(1,P) =/= Mod],
+    Opts#{patterns => Ps ++ Pats1}.
+
+tr_flags(Flags, Opts) when is_map(Opts) ->
+    Opts#{flags => Flags}.
+```
+
+The `with_trace/3` wrapper will derive the output filename from the
+Common Test `Config`: either via the property `destination`, or via
+the test case name, taken from the `tc_logfile` property maintained
+by the Common Test support logic. In the latter case, a `".tr_ct"`
+suffix is added to the test case name.
+
 
 In the wrapper, we determine which nodes to include in the trace,
 give the trace a name, then call the test case within a try ... catch.
