@@ -150,7 +150,7 @@ on_nodes(Ns, File, Spec) ->
 on_nodes(Ns, Patterns0, Flags, Opts0) ->
     Opts = lists:keydelete(tr_ttb_info, 1, Opts0),
     Patterns = expand_patterns(Patterns0),
-    Res = ttb:start_trace(Ns, Patterns, Flags, Opts),
+    Res = ttb_start_trace(Ns, Patterns, Flags, Opts),
     ?EVENT(ttb_started, maybe_info(#{ nodes => Ns
                                     , patterns => Patterns
                                     , flags    => Flags }, Opts0)),
@@ -164,8 +164,30 @@ maybe_info(Map, Opts) ->
             Map
     end.
 
-expand_patterns(Patterns) ->
-    [expand_pat(P) || P <- Patterns].
+ttb_start_trace(Ns, Patterns, Flags, Opts) ->
+    Start = maps:get(start, Patterns, []),
+    Res = ttb:start_trace(Ns, Start, Flags, Opts),
+    maps:fold(
+        fun(Op, Pats, _) when Op==tp; Op==tpl->
+                [ttb:Op(M,F,A,MS) || {M,F,A,MS} <- Pats];
+            (Op, Pats, _) when Op==ctp; Op==ctpl; Op==ctpg ->
+                [ttb:Op(M,F,A) || {M,F,A} <- Pats];
+            (tpe, Pats, _) ->
+                [dbg:tpe(E, MS) || {E, MS} <- Pats];
+            (ctpe, Pats, _) ->
+                [dbg:ctpe(E) || E <- Pats]
+        end, ok, maps:without([start], Patterns)),
+    Res.
+
+expand_patterns(Patterns) when is_map(Patterns) ->
+    maps:merge(Patterns,
+                maps:map(fun(K, V) when is_list(V) ->
+                            [expand_pat(P) || P <- V];
+                            (_, V) -> V
+                         end,
+                         maps:with([start,tp,tpl], Patterns)));
+expand_patterns(Patterns) when is_list(Patterns) ->
+    #{start => [expand_pat(P) || P <- Patterns]}.
 
 expand_pat(P) when is_tuple(P) ->
     Sz = tuple_size(P),
@@ -256,7 +278,7 @@ handler(Fd, Trace, TI, Acc) ->
         error:limit_exceeded ->
             Acc#{limit_exceeded => true};
         Caught:E:ST ->
-            fwrite(user, "CAUGHT ~p:~p:~p~n", [Caught, E, ST]),
+            fwrite(user, "CAUGHT ~p:~p:~p~nTrace=~p", [Caught, E, ST, Trace]),
             Acc
     end.
 
@@ -425,12 +447,12 @@ print_call_(Fd, Pid, N, Mod, Fun, Args, T, Acc) ->
     Indent = iolist_size(Tstr) + 3 + 4,
     Head = print_call_head(Pid, N, Mod, Fun),
     Line1Len = iolist_size([Tstr, Head]),
-    PlainArgs = rm_brackets(pp(Args, 1, Mod, Acc)),
+    PlainArgs = pp_args(Args, 1, Mod, Acc),
     Rest = case fits_on_line(PlainArgs, Line1Len, 79) of %% minus )
                true -> [PlainArgs, ")"];
                false ->
                    ["\n", indent(Indent),
-                    rm_brackets(pp(Args, Indent, Mod, Acc)), ")"]
+                    pp_args(Args, Indent, Mod, Acc), ")"]
            end,
     io_reqs(Fd, [{put_chars, unicode, [Tstr, Head, Rest]}, nl]).
 
@@ -463,13 +485,13 @@ fwrite(Fmt, Args) ->
 indent(N) ->
     lists:duplicate(N, $\s).
 
-rm_brackets(Str) ->
+rm_braces(Str) ->
     %% allow for whitespace (incl vertical) before and after
     B = iolist_to_binary(Str),
     Sz = byte_size(B),
-    {Open,1} = binary:match(B, [<<"[">>]),
+    {Open,1} = binary:match(B, [<<"{">>]),
     {Close,1} = lists:last(
-                  binary:matches(B, [<<"]">>])),
+                  binary:matches(B, [<<"}">>])),
     SzA = Open + 1,
     SzB = Sz-Close,
     SzMid = Sz - SzA - SzB,
@@ -488,6 +510,11 @@ print_tail(none, _, _Col, _Acc) -> [];
 print_tail(St, Mod, Col, Acc) ->
     Cs = pp(St, Col+1, Mod, Acc),
     [{put_chars, unicode, [lists:duplicate(Col,$\s), Cs]}, nl].
+
+%% Pretty-printing the args list as a list, may trigger the 'string' interpretation
+%% of the list. We want to remove the brackets anyway, so convert to tuple, then remove the braces
+pp_args(Args, Col, Mod, Acc) ->
+    rm_braces(pp(list_to_tuple(Args), Col, Mod, Acc)).
 
 pp(Term, Col, Mod) ->
     pp(Term, Col, Mod, #{}).
