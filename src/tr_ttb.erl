@@ -324,7 +324,7 @@ handler_(Fd, Trace, _, #{ts := TSp, diff := Diff, sofar := Sofar} = Acc) ->
 
 pid_and_node({Pid, _, Node}) ->
     {Pid, Node};
-pid_and_node(Pid) when is_pid(Pid) ->
+pid_and_node(Pid) when is_pid(Pid); is_port(Pid) ->
     {Pid, local}.
 
 fwrite(Fd, Fmt, Args) ->
