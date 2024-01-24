@@ -11,12 +11,14 @@
 {application, trace_runner,
  [
   {description, "A wrapper for tracing test runs using TTB"},
-  {vsn, "1"},
+  {vsn, git},
   {registered, []},
   {applications, [
 		  kernel,
 		  stdlib,
 		  observer
 		 ]},
+  {licenses, ["MPL-2.0"]},
+  {links, [{"GitHub", "https://github.com/uwiger/trace_runner"}]},
   {env, []}
  ]}.
