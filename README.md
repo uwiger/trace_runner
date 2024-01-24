@@ -298,3 +298,26 @@ no provision for user modification of the accumulator state.
 
 In the future, more log formatting options may be added.
 Pull requests are welcome.
+
+## Extended trace patterns
+
+If `Patterns` is given as a list, all patterns will be applied as in `ttb:start_trace/4`.
+`tr_ttb` also supports an extended description:
+
+```erlang
+PatternMap :: #{ start := [tuple()]
+               , tp   => [{M, F, A, MatchSpec}]
+               , tpl  => [{M, F, A, MatchSpec}]
+               , tpe  => [{Event, MatchSpec}]
+               , ctp  => [{M, F, A}]
+               , ctpl => [{M, F, A}]
+               , ctpg => [{M, F, A}]
+               , ctpe => [Event] }.
+```
+
+When this form is used, the `start` element (mandatory) is passed to `ttb:start_trace/4`,
+and then, the corresponding functions, `ttb:tp/2, ttb:tpl/2, ...` are called for those
+other elements that are present. Note that all the other elements are optional.
+
+This allows the caller to e.g conveniently set a wildcard trace pattern for a whole module,
+then selectively turn of trace on a few specific functions in that module.
