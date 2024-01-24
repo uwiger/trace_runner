@@ -181,7 +181,7 @@ ttb_start_trace(Ns, Patterns, Flags, Opts) ->
 
 expand_patterns(Patterns) when is_map(Patterns) ->
     maps:merge(Patterns,
-                maps:map(fun(K, V) when is_list(V) ->
+                maps:map(fun(_K, V) when is_list(V) ->
                             [expand_pat(P) || P <- V];
                             (_, V) -> V
                          end,
