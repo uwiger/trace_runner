@@ -196,6 +196,47 @@ record_fields(component_spec)	-> record_info(fields, component_spec);
 record_fields(_)		-> no.
 ```
 
+### Tracing checkpoints
+
+For some test cases, it may be useful to defer tracing start until the point
+where tricky stuff starts happening. This can be done with the functions
+`tr_ct:set_activation_checkpoint(Label, Config)`, and
+`tr_ct:trace_checkpoint(Label, Config)`.
+
+**Example:**
+```erlang
+init_per_suite(Config) ->
+    tr_ct:set_activation_checkpoint(?TABS_CREATED, Config).
+
+...
+
+encoding_sext_attrs(Config) ->
+    tr_ct:with_trace(fun encoding_sext_attrs_/1, Config,
+                     tr_patterns(mnesia_rocksdb,
+                                 [{mnesia_rocksdb,'_',x}], tr_opts())).
+
+encoding_sext_attrs_(Config) ->
+    Created = create_tabs([{t, [{attributes, [k, v]}]}], Config),
+    ok = mrdb:insert(t, {t, 1, a}),
+    ok = mnesia:dirty_write({t, 2, b}),
+    expect_error(fun() -> mrdb:insert(t, {t, a}) end, ?LINE,
+                 error, {mrdb_abort, badarg}),
+    expect_error(fun() -> mnesia:dirty_write({t, a}) end, ?LINE,
+                 exit, '_'),
+    delete_tabs(Created),
+    ok.
+
+...
+
+create_tabs(Tabs, Config) ->
+    Res = lists:map(fun create_tab/1, Tabs),
+    tr_ct:trace_checkpoint(?TABS_CREATED, Config),
+    Res.
+```
+
+The above test setup will cause tracing to start only after `create_tabs/2`
+has been completed.
+
 ## Custom formatting of terms
 
 The pretty-printer allows terms to be custom-formatted using a `pp_term(Term)` callback,
