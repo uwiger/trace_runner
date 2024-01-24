@@ -11,7 +11,7 @@
 {application, trace_runner,
  [
   {description, "A wrapper for tracing test runs using TTB"},
-  {vsn, "1"},
+  {vsn, git},
   {registered, []},
   {applications, [
 		  kernel,
