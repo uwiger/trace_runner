@@ -314,6 +314,11 @@ callback module. In addition to the normal `{yes, FieldNames} | no` returns,
 the callbacks can also return `{check_mods, Modules}`, instructing the caller
 to inspect any `record_fields/1` callbacks of the listed modules.
 
+The function `tr_ttb:pr(Term, Module)` can be used to similar effect as
+`lager:pr(Term, Module)`. It's intended to be used in e.g. log output
+and will try to pretty-print a record for a single line, given the record_info()
+data accessible via `Module`.
+
 ## Shell tracing
 
 Shell tracing can make use of the same instrumented pretty-printing via the

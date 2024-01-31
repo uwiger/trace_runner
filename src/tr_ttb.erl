@@ -30,6 +30,7 @@
          format_opts/0,
          format_opts/1,
          handler/4,
+         pr/2,                %% (Term, Module) -> string()
          pp/3,
          pp_term/2,           %% (Term, Module | F((T) -> {yes, T1} | no)) -> Term1
          pp_custom/3,         %% (Term, Tag, Fmt((X) -> X1)) -> Term1
@@ -548,6 +549,34 @@ pp_term_(L, M) when is_list(L) ->
     lmap(L, fun(T) -> pp_term(T, M) end);
 pp_term_(T, _) ->
     T.
+
+%% Similar to lager:pr(Term, Module)
+%% Tries to print term T as a record, given the record_info() data
+%% accessible via module M. Return value is a string in either case,
+%% representing the pretty-printed term, formatted for a single (long) line.
+%% The chars_limit values are somewhat arbitrarily chosen.
+%%
+pr(T, M) when is_tuple(T), is_atom(element(1,T)) ->
+    Tag = element(1, T),
+    NoFields = size(T) - 1,
+    RPF = record_print_fun(M),
+    case RPF(Tag, NoFields) of
+        no ->
+            T;
+        [] ->
+            io_lib:format("#~w{}", [Tag]);
+        Fields ->
+            Max = 1000,
+            ElemMax = 1000 div max(1,NoFields div 4),
+            [{K1,V1}|Pairs] = lists:zip(Fields, tl(tuple_to_list(T))),
+            io_lib:format("#~w{~w=~0P~s}",
+                          [Tag, K1, V1, 5,
+                           [io_lib:format(",~w=~0P",[K,V,5],
+                                         [{chars_limit, ElemMax}])
+                            || {K,V} <- Pairs]], [{chars_limit, Max}])
+    end;
+pr(T, _) ->
+    io_lib:format("~0P", [T, 5], [{chars_limit, 200}]).
 
 lmap([H|T], F) when is_list(T) ->
     [F(H)|lmap(T,F)];
