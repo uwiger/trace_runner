@@ -1,0 +1,17 @@
+{name,"trace_runner"}.
+{type,lib}.
+{modules,[]}.
+{prefix,none}.
+{desc,"Test run tracing wrapper + console tracing using TTB"}.
+{author,"Ulf Wiger"}.
+{package_id,{"uwiger","trace_runner",{0,1,0}}}.
+{deps,[]}.
+{key_name,none}.
+{a_email,"ulf@wiger.net"}.
+{c_email,"ulf@wiger.net"}.
+{copyright,"Ulf Wiger"}.
+{file_exts,[]}.
+{license,"MPL-2.0"}.
+{repo_url,"https://github.com/uwiger/trace_runner"}.
+{tags,[]}.
+{ws_url,[]}.
